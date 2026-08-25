@@ -1,0 +1,11 @@
+requests
+pandas
+hydra-core
+omegaconf
+scikit-learn
+category_encoders
+
+matplotlib
+html2image
+
+

@@ -1,0 +1,73 @@
+hydra:
+  run:
+    dir: '.'  # Keeps the working directory unchanged
+  job_logging:
+    root:
+      handlers: []  # Disables logging by not specifying any handlers
+
+
+# The URL to download the data
+download_url: "https://techassessment.blob.core.windows.net/aiap16-assessment-data/lung_cancer.db"
+
+# The type of machine learning problem
+problem_type: "binary_classification"
+
+# Features
+# This section outlines the target variable and the types of features (numerical, categorical, and ordinal) used in the model.
+features:
+  target_variable: lung_cancer_occurrence
+  numerical:
+    - age
+    - current_weight
+    - last_weight
+  categorical:
+    - gender
+    - copd_history
+    - genetic_markers
+    - taken_bronchodilators
+    - dominant_hand
+  ordinal:
+    - air_pollution_exposure
+    - frequency_of_tiredness
+
+# Feature Engineering Steps
+# This section details the feature engineering steps including what features to drop, imputation, scaling, and encoding methods.
+transformations:
+  impute: true
+  imputation:
+    numerical: median
+    categorical: most_frequent
+    ordinal: most_frequent
+  scaling: true
+  scaling_method: minmax # ['minmax', 'standard'] 
+  categorical_encoding_method: onehot
+  remove_outliers: true
+  features_to_drop:
+    - copd_history
+    - taken_bronchodilators
+    - dominant_hand
+    - last_weight
+    - age
+    - dominant_hand
+    - id
+    - start_smoking
+    - stop_smoking
+
+# Training Configuration
+# This section outlines the configuration for training the model including the model type, performance metric, hyperparameter tuning, and ensemble methods.
+training:
+  models: # List of models to train, ['LR', 'RFC', 'XGB', 'Cat', 'GBC']
+    - GBC
+    - XGB
+    - RFC
+    - LR
+  ensemble: true # If true, ensemble methods such as stacking and voting will be used
+  performance_metric: recall # ['accuracy', 'precision', 'recall', 'f1', 'roc_auc']
+  tune: true
+  tune_metric: recall # metric to tune the hyperparameters on 
+  n_iter: 10
+  save_model: true
+  save_dir: models
+  verbose: 0
+  
+  
