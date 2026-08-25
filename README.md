@@ -3,35 +3,67 @@
 Predicting residential house sale prices on the [Ames Housing dataset](https://www.kaggle.com/competitions/house-prices-advanced-regression-techniques)
 (Kaggle's *House Prices: Advanced Regression Techniques*).
 
-The work is an end-to-end regression study: data inspection, exploratory analysis,
-preprocessing, feature engineering, feature selection, and a comparison of seven
-regularised / boosted / ensembled regressors, ending in a weighted blend used for
-the Kaggle submission.
+An end-to-end regression study: data inspection, exploratory analysis, preprocessing,
+feature engineering, feature selection, and a comparison of seven regularised / boosted /
+ensembled regressors, blended by non-negative least squares on out-of-fold predictions.
 
-**Best single model:** Gradient Boosting Regressor — RMSE **20,749**, R² **0.911** on the hold-out split.
-**Best overall:** weighted blend of all seven models — RMSE **19,873**, R² **0.918**.
+Scored on **RMSLE**, the competition metric. Best out-of-fold result: **0.1057** (voting
+regressor), with the stacked model statistically tied at 0.1057.
 
 ---
 
 ## Results
 
-Hold-out performance, target transformed before fitting and inverse-transformed for scoring:
+Five-fold out-of-fold scores on the training split, plus a single held-out validation
+split that was never used to fit, tune, select or weight anything:
 
-| Model | MAE | RMSE | R² |
-|---|---:|---:|---:|
-| Bayesian Ridge | 14,331 | 20,256 | 0.915 |
-| Ridge | 14,332 | 20,305 | 0.915 |
-| Voting Regressor | 14,454 | 20,502 | 0.913 |
-| CatBoost | 14,770 | 20,649 | 0.912 |
-| Gradient Boosting | 14,623 | 20,749 | 0.911 |
-| LightGBM | 15,002 | 21,330 | 0.906 |
-| Stacking (meta-learner) | 14,576 | 21,351 | 0.906 |
-| **Weighted blend (all 7)** | **13,941** | **19,873** | **0.918** |
+| Model | OOF RMSLE | fold σ | Val RMSLE | Val RMSE ($) |
+|---|---:|---:|---:|---:|
+| Voting regressor | **0.10570** | 0.0096 | 0.12297 | 22,456 |
+| Stacking (out-of-fold meta-features) | 0.10575 | 0.0107 | **0.12252** | 21,817 |
+| Gradient Boosting | 0.10832 | 0.0087 | 0.12843 | 23,991 |
+| Bayesian Ridge | 0.11014 | 0.0118 | 0.12485 | 21,536 |
+| CatBoost | 0.11018 | 0.0071 | 0.12706 | 26,206 |
+| Ridge | 0.11126 | 0.0119 | 0.12359 | 21,619 |
+| LightGBM | 0.11183 | 0.0074 | 0.12814 | 25,643 |
+| NNLS blend | 0.10542¹ | — | 0.12347 | 22,102 |
 
-Blend weights are inverse to each model's RMSE, so stronger models contribute more.
+¹ The blend's OOF figure is measured on the same out-of-fold predictions its weights were
+fitted to, so it is mildly optimistic and is shown for reference only. Its honest number
+is the validation column.
 
-Three target transformations were compared — log, Box-Cox, and Yeo-Johnson — with a
-submission file produced for each.
+**Read the fold σ column before reading the ranking.** The spread across folds (±0.007 to
+±0.012) is larger than the gap between first and last place (0.0061). The ordering above is
+not statistically meaningful — the top two are tied, and the honest conclusion is that a
+regularised linear model, a boosted ensemble and a stack all land in the same place on this
+dataset.
+
+The NNLS blend puts its weight on stacking (0.44), gradient boosting (0.31), Bayesian Ridge
+(0.17) and LightGBM (0.08), and zeroes out ridge, CatBoost and the voting regressor as
+redundant. It does **not** beat the best single model on the untouched validation split.
+
+---
+
+## Validation protocol
+
+Every number above comes from this protocol, which is worth stating explicitly because it
+is what makes the numbers comparable:
+
+- **Preprocessing lives inside the pipeline.** Imputation, scaling and encoding are steps
+  in a `ColumnTransformer`, so they are refit on every CV fold rather than fit once on the
+  full frame.
+- **Target transform via `TransformedTargetRegressor`**, using `log1p`. This makes the
+  in-CV objective (neg-MSE on the transformed target) numerically identical to MSLE, so
+  tuning, selection and reporting all optimise the competition metric.
+- **Outliers are removed from the training split only.** They are flagged before the split
+  and dropped after it — you cannot delete inconvenient rows at inference time, so the
+  validation set keeps its hard cases.
+- **Blend weights are fitted on out-of-fold predictions** (NNLS in log space), never on the
+  data the blend is then scored against.
+- **Stacking uses out-of-fold meta-features** via sklearn's `StackingRegressor(cv=...)`.
+- **An assertion guards the `ColumnTransformer`.** `remainder='drop'` means any column
+  missing from the feature lists is silently discarded; the notebook now fails loudly
+  instead of training on a quietly truncated frame.
 
 ---
 
@@ -42,7 +74,7 @@ submission file produced for each.
 │   └── notebooks/
 │       └── regression_ames_house_prices.ipynb   # ← the actual work (118 cells)
 ├── house_prices_advanced_regression_techniques/
-│   ├── submission/                              # Kaggle submission CSVs per model / transformation
+│   ├── submission/                              # Kaggle submission CSVs
 │   └── reference/                               # public Kaggle notebooks collected for study (not mine)
 ├── conf/                                        # Hydra config + model params (see caveat below)
 ├── src/                                         # modular pipeline scaffolding (see caveat below)
@@ -72,33 +104,39 @@ intended to be — porting them to regression is outstanding work.
 inconsistent categorical values, case-inconsistent formatting, dtype correction.
 
 **EDA** — univariate analysis of `SalePrice` and of the continuous, ordinal and categorical
-predictors; bivariate analysis against the target; multicollinearity screening.
+predictors; bivariate analysis against the target; multicollinearity screening on absolute
+correlation.
 
-**Preprocessing** — drops highly correlated and near-constant dominating features, then
-imputes missing values and handles outliers.
+**Preprocessing** — drops true near-duplicate columns and near-constant features. Note that
+aggressive collinearity pruning is deliberately *not* done: every model here is either
+L2-regularised or a tree ensemble, and neither is harmed by correlated inputs.
 
-**Feature engineering** — new derived features, target transformation (log / Box-Cox /
-Yeo-Johnson compared), and feature selection via `SelectKBest` with `f_regression` and
-mutual information.
+**Feature engineering** — `TotalSF`, `TotalBath`, `TotalBsmtFin`, `TotalPorch`, built from
+their component columns and registered into the continuous feature group.
+
+**Feature selection** — `SelectKBest` with `f_regression` and mutual information. These
+scores are **diagnostic only**; no features are dropped on the basis of them.
 
 **Modelling** — PyCaret for a fast first pass at model scoping, then Bayesian Ridge, Ridge,
-CatBoost, Gradient Boosting, LightGBM, a stacking meta-learner, and a voting regressor;
-finally the weighted blend.
+CatBoost, Gradient Boosting and LightGBM, each tuned by `RandomizedSearchCV` over 5 folds;
+then a stacking meta-learner, a voting regressor, and the NNLS blend.
 
 ---
 
 ## Running it
 
+Verified on Python 3.11. PyCaret pins `scikit-learn` and `scipy` fairly tightly, which is
+why `requirements.txt` carries bounds rather than bare names.
+
 ```bash
-python -m venv .venv && source .venv/bin/activate
+python3.11 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-# the notebook also uses: seaborn, plotly, lightgbm, catboost, pycaret, scipy
 jupyter lab reports/notebooks/regression_ames_house_prices.ipynb
 ```
 
 The dataset is not committed (`data/` is gitignored). Download it from the
 [competition page](https://www.kaggle.com/competitions/house-prices-advanced-regression-techniques/data)
-and place it so the notebook's relative paths resolve from the repo root:
+and place it at the repository root:
 
 ```
 data/raw/train.csv
@@ -106,7 +144,9 @@ data/raw/test.csv
 data/raw/data_description.txt
 ```
 
-Then run the notebook top to bottom.
+The notebook locates the project root itself, so it runs whether the kernel starts in the
+repo root or in `reports/notebooks/`. Run it top to bottom; a full pass including all
+hyperparameter searches takes roughly 25 minutes on a laptop.
 
 ---
 
