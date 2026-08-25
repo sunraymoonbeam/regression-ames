@@ -7,8 +7,10 @@ An end-to-end regression study: data inspection, exploratory analysis, preproces
 feature engineering, feature selection, and a comparison of seven regularised / boosted /
 ensembled regressors, blended by non-negative least squares on out-of-fold predictions.
 
-Scored on **RMSLE**, the competition metric. Best out-of-fold result: **0.1057** (voting
-regressor), with the stacked model statistically tied at 0.1057.
+Scored on **RMSLE**, the competition metric. Best out-of-fold result: **0.1059** (stacking),
+with the voting regressor statistically tied at 0.1062. An earlier revision of this
+pipeline scored **0.124 on the Kaggle leaderboard**, against a predicted 0.12–0.13 and a
+local validation figure of 0.1235 — so the validation protocol below is calibrated.
 
 ---
 
@@ -19,28 +21,39 @@ split that was never used to fit, tune, select or weight anything:
 
 | Model | OOF RMSLE | fold σ | Val RMSLE | Val RMSE ($) |
 |---|---:|---:|---:|---:|
-| Voting regressor | **0.10570** | 0.0096 | 0.12297 | 22,456 |
-| Stacking (out-of-fold meta-features) | 0.10575 | 0.0107 | **0.12252** | 21,817 |
-| Gradient Boosting | 0.10832 | 0.0087 | 0.12843 | 23,991 |
-| Bayesian Ridge | 0.11014 | 0.0118 | 0.12485 | 21,536 |
-| CatBoost | 0.11018 | 0.0071 | 0.12706 | 26,206 |
-| Ridge | 0.11126 | 0.0119 | 0.12359 | 21,619 |
-| LightGBM | 0.11183 | 0.0074 | 0.12814 | 25,643 |
-| NNLS blend | 0.10542¹ | — | 0.12347 | 22,102 |
+| Stacking (out-of-fold meta-features) | **0.10595** | 0.0100 | 0.12126 | 22,569 |
+| Voting regressor | 0.10615 | 0.0096 | 0.12164 | 23,371 |
+| Gradient Boosting | 0.10869 | 0.0077 | 0.12721 | 23,243 |
+| ElasticNet | 0.10977 | 0.0105 | 0.12488 | 23,857 |
+| Lasso | 0.10993 | 0.0109 | **0.12108** | 23,563 |
+| Bayesian Ridge | 0.11015 | 0.0109 | 0.12387 | 23,612 |
+| CatBoost | 0.11076 | 0.0078 | 0.12638 | 25,373 |
+| Ridge | 0.11137 | 0.0114 | 0.12229 | 23,523 |
+| LightGBM | 0.11257 | 0.0076 | 0.12845 | 25,057 |
+| NNLS blend | 0.10540¹ | — | 0.12162 | 22,732 |
 
 ¹ The blend's OOF figure is measured on the same out-of-fold predictions its weights were
 fitted to, so it is mildly optimistic and is shown for reference only. Its honest number
 is the validation column.
 
-**Read the fold σ column before reading the ranking.** The spread across folds (±0.007 to
-±0.012) is larger than the gap between first and last place (0.0061). The ordering above is
+**Read the fold σ column before reading the ranking.** The spread across folds (±0.008 to
+±0.011) is larger than the gap between first and last place (0.0066). The ordering above is
 not statistically meaningful — the top two are tied, and the honest conclusion is that a
 regularised linear model, a boosted ensemble and a stack all land in the same place on this
-dataset.
+dataset. Note that Lasso ranks 5th out-of-fold but 1st on validation: exactly the kind of
+reshuffling the fold σ predicts, and a reason not to read either column too closely.
 
-The NNLS blend puts its weight on stacking (0.44), gradient boosting (0.31), Bayesian Ridge
-(0.17) and LightGBM (0.08), and zeroes out ridge, CatBoost and the voting regressor as
-redundant. It does **not** beat the best single model on the untouched validation split.
+The NNLS blend puts its weight on gradient boosting (0.42), Lasso (0.29) and stacking
+(0.28), zeroing out everything else as redundant. Lasso earning 29% of the blend is the
+clearest evidence that adding L1 was worthwhile — it contributes diversity the L2 models
+and the trees do not, even though its own OOF rank is mid-table.
+
+**On the size of these gains:** relative to the revision that scored 0.124, the changes
+below moved out-of-fold from 0.1057 to 0.1059 (i.e. not at all) and validation from 0.1225
+to 0.1211. Both differences sit well inside the fold σ. The honest statement is that the
+feature work is defensible on its merits and produced a better-behaved model — predictions
+no longer extrapolate 20% past the training maximum — but it did not produce a measurable
+accuracy gain on a dataset this size.
 
 ---
 
@@ -61,6 +74,8 @@ is what makes the numbers comparable:
 - **Blend weights are fitted on out-of-fold predictions** (NNLS in log space), never on the
   data the blend is then scored against.
 - **Stacking uses out-of-fold meta-features** via sklearn's `StackingRegressor(cv=...)`.
+- **Learned imputations live in the pipeline too**, including the per-`Neighborhood`
+  median used for `LotFrontage`, which is a fitted statistic and so must be refit per fold.
 - **An assertion guards the `ColumnTransformer`.** `remainder='drop'` means any column
   missing from the feature lists is silently discarded; the notebook now fails loudly
   instead of training on a quietly truncated frame.
@@ -109,17 +124,23 @@ correlation.
 
 **Preprocessing** — drops true near-duplicate columns and near-constant features. Note that
 aggressive collinearity pruning is deliberately *not* done: every model here is either
-L2-regularised or a tree ensemble, and neither is harmed by correlated inputs.
+regularised or a tree ensemble, and neither is harmed by correlated inputs. Columns are
+also not discarded for missingness alone: where `NA` means "absent" (`GarageType`,
+`MasVnrType`) it becomes an explicit `None` category, and `LotFrontage` is imputed with its
+neighbourhood median rather than dropped.
 
-**Feature engineering** — `TotalSF`, `TotalBath`, `TotalBsmtFin`, `TotalPorch`, built from
-their component columns and registered into the continuous feature group.
+**Feature engineering** — `TotalSF`, `TotalBath`, `TotalBsmtFin`, `TotalPorch`, plus
+`HouseAge` and `RemodAge` (age at sale is a more direct parametrisation than the raw
+calendar years), all registered into the continuous feature group. Continuous predictors
+are skew-corrected with Yeo-Johnson inside the pipeline, not just the target.
 
 **Feature selection** — `SelectKBest` with `f_regression` and mutual information. These
 scores are **diagnostic only**; no features are dropped on the basis of them.
 
 **Modelling** — PyCaret for a fast first pass at model scoping, then Bayesian Ridge, Ridge,
-CatBoost, Gradient Boosting and LightGBM, each tuned by `RandomizedSearchCV` over 5 folds;
-then a stacking meta-learner, a voting regressor, and the NNLS blend.
+Lasso, ElasticNet, CatBoost, Gradient Boosting and LightGBM, each tuned by
+`RandomizedSearchCV` over 5 folds; then a stacking meta-learner, a voting regressor, and
+the NNLS blend.
 
 ---
 
@@ -146,7 +167,7 @@ data/raw/data_description.txt
 
 The notebook locates the project root itself, so it runs whether the kernel starts in the
 repo root or in `reports/notebooks/`. Run it top to bottom; a full pass including all
-hyperparameter searches takes roughly 25 minutes on a laptop.
+hyperparameter searches takes roughly 40 minutes on a laptop.
 
 ---
 
