@@ -1,11 +1,30 @@
+# Verified working set (Python 3.11). pycaret pins scikit-learn and scipy fairly
+# tightly, so the bounds below are what actually co-resolve.
+
+# --- core ---
+numpy<2
+pandas>=2.1,<2.3
+scikit-learn>=1.4,<1.5
+scipy>=1.11,<1.12
+
+# --- visualisation (notebook) ---
+matplotlib
+seaborn
+plotly
+
+# --- gradient boosting libraries (notebook) ---
+catboost
+lightgbm
+
+# --- optional: only needed for the "Quick Model Scoping with pycaret" section ---
+pycaret>=3.3,<3.4
+
+# --- notebook runtime ---
+jupyterlab
+ipykernel
+
+# --- used only by the src/ + conf/ CLI scaffolding, not by the notebook ---
 requests
-pandas
 hydra-core
 omegaconf
-scikit-learn
 category_encoders
-
-matplotlib
-html2image
-
-
