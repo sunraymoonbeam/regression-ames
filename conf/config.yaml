@@ -6,68 +6,108 @@ hydra:
       handlers: []  # Disables logging by not specifying any handlers
 
 
-# The URL to download the data
-download_url: "https://techassessment.blob.core.windows.net/aiap16-assessment-data/lung_cancer.db"
+# Where the Kaggle competition data lives, relative to the project root.
+# Download from:
+#   https://www.kaggle.com/competitions/house-prices-advanced-regression-techniques/data
+data:
+  raw_dir: data/raw
+  train_file: train.csv
+  test_file: test.csv
+  submission_dir: house_prices_advanced_regression_techniques/submission
 
-# The type of machine learning problem
-problem_type: "binary_classification"
+problem_type: regression
+target_variable: SalePrice
+index_column: Id
 
-# Features
-# This section outlines the target variable and the types of features (numerical, categorical, and ordinal) used in the model.
-features:
-  target_variable: lung_cancer_occurrence
-  numerical:
-    - age
-    - current_weight
-    - last_weight
-  categorical:
-    - gender
-    - copd_history
-    - genetic_markers
-    - taken_bronchodilators
-    - dominant_hand
-  ordinal:
-    - air_pollution_exposure
-    - frequency_of_tiredness
 
-# Feature Engineering Steps
-# This section details the feature engineering steps including what features to drop, imputation, scaling, and encoding methods.
-transformations:
-  impute: true
-  imputation:
-    numerical: median
-    categorical: most_frequent
-    ordinal: most_frequent
-  scaling: true
-  scaling_method: minmax # ['minmax', 'standard'] 
-  categorical_encoding_method: onehot
-  remove_outliers: true
-  features_to_drop:
-    - copd_history
-    - taken_bronchodilators
-    - dominant_hand
-    - last_weight
-    - age
-    - dominant_hand
-    - id
-    - start_smoking
-    - stop_smoking
+# Cleaning -- mirrors the Data Inspection / Preprocessing sections of the notebook.
+cleaning:
+  # Numeric codes that are really nominal categories.
+  recode_as_categorical:
+    - MSSubClass
+    - MoSold
 
-# Training Configuration
-# This section outlines the configuration for training the model including the model type, performance metric, hyperparameter tuning, and ensemble methods.
+  # Drop features where one value dominates this fraction of rows.
+  near_constant_threshold: 0.95
+
+  # Only true near-duplicates are dropped. Every model here is either regularised
+  # or a tree ensemble, so aggressive collinearity pruning only discards signal.
+  collinear_to_drop:
+    - GarageCond    # r ~ 0.95 with GarageQual
+    - GarageYrBlt   # r ~ 0.83 with YearBuilt, and adds missing values
+
+  # NA means "the feature is absent", not "unknown". A deterministic mapping, so
+  # it cannot leak.
+  absent_means_none:
+    - MasVnrType
+    - GarageType
+    - GarageFinish
+
+  # Dropped outright: 96.4% missing, and its companion MiscVal is already removed
+  # as near-constant.
+  drop_columns:
+    - MiscFeature
+
+
+# Outlier thresholds, evaluated on the ORIGINAL training columns. These rows are
+# removed from the training split only, never from validation or test -- you
+# cannot drop inconvenient rows at inference time.
+outliers:
+  enabled: true
+  thresholds:
+    LotFrontage: 200
+    LotArea: 100000
+    BsmtFinSF1: 4000
+    TotalBsmtSF: 5000
+    GrLivArea: 4000
+
+
+feature_engineering:
+  aggregates: true    # TotalSF, TotalBath, TotalBsmtFin, TotalPorch
+  age_features: true  # HouseAge, RemodAge
+
+
+# Preprocessing. Every step here is fit inside the CV folds, never on the full frame.
+preprocessing:
+  numeric_imputation: median            # ['median', 'mean']
+  categorical_imputation: most_frequent
+  ordinal_imputation: most_frequent
+  # yeo-johnson corrects predictor skew and standardises in one step, and unlike
+  # log1p it tolerates zeros (TotalPorch) and negatives (RemodAge).
+  numeric_scaling: yeo-johnson          # ['yeo-johnson', 'standard', 'minmax', 'robust']
+  categorical_encoding: onehot
+  # LotFrontage is imputed with the median of its Neighborhood -- a learned
+  # statistic, so it is fit per fold. Set to null to fall back to a plain median.
+  lot_frontage_group_column: Neighborhood
+
+
 training:
-  models: # List of models to train, ['LR', 'RFC', 'XGB', 'Cat', 'GBC']
-    - GBC
-    - XGB
-    - RFC
-    - LR
-  ensemble: true # If true, ensemble methods such as stacking and voting will be used
-  performance_metric: recall # ['accuracy', 'precision', 'recall', 'f1', 'roc_auc']
+  # ['ridge', 'lasso', 'elasticnet', 'bayesian_ridge', 'gbr', 'catboost', 'lgbm']
+  models:
+    - ridge
+    - lasso
+    - elasticnet
+    - bayesian_ridge
+    - gbr
+    - catboost
+    - lgbm
+
+  # The competition metric is RMSLE. The log transform makes the in-CV objective
+  # (neg MSE on the transformed target) numerically identical to MSLE, so tuning,
+  # selection and reporting all optimise the same thing.
+  target_transform: log        # ['log', 'boxcox', 'yeojohnson', 'none']
+  metric: rmsle                # ['rmsle', 'rmse', 'mae', 'r2']
+
+  test_size: 0.2
+  random_state: 42
+  cv_folds: 5
+
   tune: true
-  tune_metric: recall # metric to tune the hyperparameters on 
-  n_iter: 10
+  n_iter: 100
+
+  ensemble: true   # stacking (out-of-fold meta-features) + voting
+  blend: true      # NNLS weights fitted on out-of-fold predictions
+
   save_model: true
   save_dir: models
   verbose: 0
-  
-  

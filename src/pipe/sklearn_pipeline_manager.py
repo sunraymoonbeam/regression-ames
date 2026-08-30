@@ -1,211 +1,145 @@
+"""Construction of the preprocessing pipeline.
+
+Every learned transformation lives here rather than being applied to the frame
+up front, so each one is refit on every CV fold. Fitting an imputer or a scaler
+once on the whole dataset and then cross-validating over it leaks information
+between folds and produces an optimistic score.
+"""
+
+import logging
+from typing import Dict, List
+
+import numpy as np
+import pandas as pd
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline, make_pipeline
 from sklearn.preprocessing import (
-    StandardScaler,
     MinMaxScaler,
     OneHotEncoder,
     OrdinalEncoder,
+    PowerTransformer,
+    RobustScaler,
+    StandardScaler,
 )
-from category_encoders import TargetEncoder
-from sklearn import set_config
-import itertools
-from sklearn.metrics import (
-    accuracy_score,
-    precision_score,
-    recall_score,
-    f1_score,
-    roc_auc_score,
-)
-from sklearn.model_selection import RandomizedSearchCV
 
-set_config(
-    display="diagram", transform_output="pandas"
-)  # Transformers returns pandas dataframes rather then numpy arrays
+
+class NeighborhoodMedianImputer(BaseEstimator, TransformerMixin):
+    """Impute LotFrontage with the median of its Neighborhood.
+
+    Lot frontage is largely set by the street layout of a neighbourhood, so the
+    neighbourhood median is a much better estimate than a global one -- good
+    enough that it is worth keeping a column that is 16.6% missing rather than
+    discarding it.
+
+    The medians are *learned*, so this has to be a transformer fit inside the
+    pipeline rather than a one-off pass over the whole frame. Unseen groups and
+    groups that are entirely missing fall back to the global median.
+    """
+
+    def __init__(self, target_col: str = "LotFrontage", group_col: str = "Neighborhood") -> None:
+        self.target_col = target_col
+        self.group_col = group_col
+
+    def fit(self, X: pd.DataFrame, y=None) -> "NeighborhoodMedianImputer":
+        self.active_ = (
+            self.group_col is not None
+            and self.target_col in X.columns
+            and self.group_col in X.columns
+        )
+        if self.active_:
+            self.medians_ = X.groupby(self.group_col)[self.target_col].median()
+            self.global_median_ = X[self.target_col].median()
+        return self
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        if not self.active_:
+            return X
+        X = X.copy()
+        fill = X[self.group_col].map(self.medians_).fillna(self.global_median_)
+        X[self.target_col] = X[self.target_col].fillna(fill)
+        return X
+
+
+def _numeric_scaler(method: str):
+    scalers = {
+        # Corrects predictor skew and standardises in one step. Unlike log1p it
+        # tolerates the zeros in TotalPorch and the negatives RemodAge can take.
+        "yeo-johnson": PowerTransformer(method="yeo-johnson", standardize=True),
+        "standard": StandardScaler(),
+        "minmax": MinMaxScaler(),
+        "robust": RobustScaler(),
+    }
+    if method not in scalers:
+        raise ValueError(f"Unknown numeric_scaling '{method}'. Options: {sorted(scalers)}")
+    return scalers[method]
 
 
 class TransformerPipelineManager:
-    """
-    This class is responsible for creating, fitting and evaluating a machine learning pipeline.
+    """Builds the ColumnTransformer and wraps models in a full pipeline."""
 
-    Attributes
-    ----------
-    logger : Logger
-        a logger for logging events during model training
+    def __init__(self, features: Dict[str, List[str]], cfg, logger: logging.Logger = None) -> None:
+        self.features = features
+        self.cfg = cfg
+        self.logger = logger or logging.getLogger(__name__)
+        self.preprocessor = self.create_preprocessor()
 
-    Methods
-    -------
-    create_numeric_transformer(scaling_method, numerical_imputation_method=None):
-        Create a transformer for numerical features.
-    create_categorical_transformer(categorical_encoding_method, categorical_imputation_method=None):
-        Create a transformer for categorical features.
-    create_ordinal_transformer():
-        Create a transformer for ordinal features.
-    create_transformations(scaling_options, encoding_options, numeric_columns, categorical_columns, ordinal_columns):
-        Create all combinations of transformations for the given options and columns.
-    create_pipeline():
-        Initialize a Pipeline with placeholders for the data transformations and classifier.
-    create_param_grid(transformations, models, MODEL_PARAMETERS):
-        Define the parameter grid for RandomizedSearchCV.
-    fit_pipeline(X_train, y_train):
-        Fit the pipeline using RandomizedSearchCV.
-    evaluate_pipeline(X_test, y_test):
-        Evaluate the best model pipeline.
-    """
-
-    def __init__(self, logger):
-        """
-        Initialize the PipelineTransformer with a logger.
-        """
-        self.logger = logger
-
-    def create_numeric_transformer(
-        self, scaling_method, numerical_imputation_method=None
-    ):
-        steps = (
-            [
-                (
-                    "imputer",
-                    SimpleImputer(strategy=numerical_imputation_method or "median"),
-                )
-            ]
-            if numerical_imputation_method
-            else []
-        )
-        steps.append(
-            (
-                "scaler",
-                MinMaxScaler() if scaling_method == "minmax" else StandardScaler(),
+    def verify_coverage(self, columns) -> None:
+        """ColumnTransformer drops anything not named in a transformer."""
+        covered = set().union(*self.features.values())
+        uncovered = set(columns) - covered
+        if uncovered:
+            raise AssertionError(
+                f"Columns not covered by the preprocessor (they would be silently "
+                f"dropped before every model): {sorted(uncovered)}"
             )
+
+    def create_preprocessor(self) -> ColumnTransformer:
+        pre = self.cfg.preprocessing
+
+        numeric_transformer = make_pipeline(
+            SimpleImputer(strategy=pre.numeric_imputation),
+            _numeric_scaler(pre.numeric_scaling),
         )
-        return Pipeline(steps=steps)
-
-    def create_categorical_transformer(
-        self, categorical_encoding_method, categorical_imputation_method=None
-    ):
-        steps = (
-            [
-                (
-                    "imputer",
-                    SimpleImputer(
-                        strategy=categorical_imputation_method or "constant",
-                        fill_value="missing",
-                    ),
-                )
-            ]
-            if categorical_imputation_method
-            else []
+        categorical_transformer = make_pipeline(
+            SimpleImputer(strategy=pre.categorical_imputation),
+            OneHotEncoder(sparse_output=False, handle_unknown="ignore"),
         )
-        steps.append(
-            (
-                "encoder",
-                (
-                    OneHotEncoder(handle_unknown="ignore", sparse_output=False)
-                    if categorical_encoding_method == "onehot"
-                    else TargetEncoder()
-                ),
-            )
+        ordinal_transformer = make_pipeline(
+            SimpleImputer(strategy=pre.ordinal_imputation),
+            OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1),
         )
-        return Pipeline(steps=steps)
-
-    def create_ordinal_transformer(self):
-        return Pipeline(steps=[("ordinal", OrdinalEncoder())])
-
-    def create_transformations(
-        self,
-        scaling_options,
-        encoding_options,
-        numeric_columns,
-        categorical_columns,
-        ordinal_columns,
-    ):
-        numeric_transformers = [
-            self.create_numeric_transformer(option) for option in scaling_options
-        ]
-        categorical_transformers = [
-            self.create_categorical_transformer(option) for option in encoding_options
-        ]
-        ordinal_transformer = self.create_ordinal_transformer()
-
-        transformations = []
-        for num_transformer, cat_transformer in itertools.product(
-            numeric_transformers, categorical_transformers
-        ):
-            transformation = ColumnTransformer(
-                transformers=[
-                    ("num", num_transformer, numeric_columns),
-                    ("cat", cat_transformer, categorical_columns),
-                    ("ord", ordinal_transformer, ordinal_columns),
-                ]
-            )
-            transformations.append(transformation)
-
-        return transformations
-
-    def create_pipeline(self):
-        self.logger.info("Creating pipeline...")
-        self.pipe = Pipeline(
-            steps=[
-                (
-                    "data_transformations",
-                    "passthrough",
-                ),  # 'passthrough' means that this step will be replaced
-                (
-                    "clf",
-                    "passthrough",
-                ),  # 'passthrough' means that this step will be replaced
-            ]
-        )
-
-    def create_param_grid(self, transformations, models, MODEL_PARAMETERS):
-        self.params_grid = [
-            {
-                "data_transformations": transformations,
-                "clf": [model],
-                **{
-                    f"clf__{param}": values
-                    for param, values in MODEL_PARAMETERS[model_name].items()
-                },
-            }
-            for model_name, model in models.items()
-            if model_name in MODEL_PARAMETERS
-        ]
-
-    def fit_pipeline(self, X_train, y_train, n_iter, tune_metric="recall"):
-        self.logger.info("Fitting pipeline...")
-        self.best_model_pipeline = RandomizedSearchCV(
-            estimator=self.pipe,
-            param_distributions=self.params_grid,
-            n_iter=n_iter,
-            scoring=tune_metric,
-            n_jobs=-1,
-            cv=5,
-            random_state=21,
-            error_score="raise",
-            return_train_score=False,
-        )
-        self.best_model_pipeline.fit(X_train, y_train)
 
         self.logger.info(
-            f"Best Data Pipeline: {self.best_model_pipeline.best_estimator_[0]}"
-        )
-        self.logger.info(
-            f"Best Classifier: {self.best_model_pipeline.best_estimator_[1]}"
+            f"Preprocessor: {len(self.features['continuous'])} continuous "
+            f"({pre.numeric_imputation} impute, {pre.numeric_scaling}), "
+            f"{len(self.features['categorical'])} categorical (onehot), "
+            f"{len(self.features['ordinal'])} ordinal"
         )
 
-    def evaluate_pipeline(self, X_test, y_test):
-        if self.best_model_pipeline is None:
-            raise Exception(
-                "The pipeline has not been fitted yet. Please call fit_pipeline first."
-            )
+        return ColumnTransformer(
+            transformers=[
+                ("num", numeric_transformer, self.features["continuous"]),
+                ("cat", categorical_transformer, self.features["categorical"]),
+                ("ord", ordinal_transformer, self.features["ordinal"]),
+            ]
+        )
 
-        y_pred = self.best_model_pipeline.predict(X_test)
-        result = {
-            "accuracy": accuracy_score(y_test, y_pred),
-            "recall": recall_score(y_test, y_pred),
-            "precision": precision_score(y_test, y_pred),
-            "f1": f1_score(y_test, y_pred),
-            "roc_auc": roc_auc_score(y_test, y_pred),
-        }
-        self.logger.info(f"Performance: {result}")
-        return result
+    def build_pipeline(self, model) -> Pipeline:
+        """Front-end plus estimator.
+
+        A factory rather than an inline `make_pipeline` at each call site, so the
+        LotFrontage imputer cannot be accidentally left out of one model's
+        pipeline. The estimator keeps its usual step name, so parameter grids
+        prefixed with the lowercased class name still apply.
+
+        No `memory=` cache: joblib.Memory hashes each step to build a cache key
+        and cannot hash a locally-defined transformer class, which makes every
+        fit in a search fail. The fits are cheap enough not to need it.
+        """
+        return make_pipeline(
+            NeighborhoodMedianImputer(group_col=self.cfg.preprocessing.lot_frontage_group_column),
+            self.preprocessor,
+            model,
+        )
