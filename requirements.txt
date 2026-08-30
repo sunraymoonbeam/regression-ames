@@ -23,8 +23,7 @@ pycaret>=3.3,<3.4
 jupyterlab
 ipykernel
 
-# --- used only by the src/ + conf/ CLI scaffolding, not by the notebook ---
-requests
+# --- CLI pipeline (main.py); not needed for the notebook alone ---
 hydra-core
 omegaconf
-category_encoders
+joblib

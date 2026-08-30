@@ -1,102 +1,116 @@
+"""Regressor registry, default parameters and search grids.
+
+Grid keys use the estimator's step name as produced by `make_pipeline`, which is
+the lowercased class name -- so they can be handed straight to a search over the
+full pipeline.
+"""
+
 import numpy as np
 
-"""
-This configuration file contains constants for machine learning models.
-
-The constants include:
-- Parameters for Gradient Boosting Classifier (GBC), CatBoost Classifier (Cat), 
-  XGBoost (XGB), Random Forest Classifier (RFC), and Logistic Regression (LR).
-- Parameter grids for hyperparameter tuning of the above models.
-
-Each model has its own dictionary of parameters. For each parameter, a brief description 
-is provided in the form of a comment.
-"""
-
-# Mapping between model class names and keys in MODEL_PARAM_GRIDS
+# Short name used in config.yaml -> scikit-learn style class name.
 MODEL_NAME_MAPPING = {
-    "GBC": "GradientBoostingClassifier",
-    "Cat": "CatBoostClassifier",
-    "XGB": "XGBClassifier",
-    "RFC": "RandomForestClassifier",
-    "LR": "LogisticRegression",
+    "ridge": "Ridge",
+    "lasso": "Lasso",
+    "elasticnet": "ElasticNet",
+    "bayesian_ridge": "BayesianRidge",
+    "gbr": "GradientBoostingRegressor",
+    "catboost": "CatBoostRegressor",
+    "lgbm": "LGBMRegressor",
 }
 
-# Model parameters
+# Pipeline step name for each model, used to prefix its grid.
+MODEL_STEP_NAMES = {
+    "Ridge": "ridge",
+    "Lasso": "lasso",
+    "ElasticNet": "elasticnet",
+    "BayesianRidge": "bayesianridge",
+    "GradientBoostingRegressor": "gradientboostingregressor",
+    "CatBoostRegressor": "catboostregressor",
+    "LGBMRegressor": "lgbmregressor",
+}
+
 DEFAULT_MODEL_PARAMETERS = {
-    "GradientBoostingClassifier": {
-        "n_estimators": 100,  # The number of boosting stages to perform
-        "learning_rate": 0.1,  # Learning rate shrinks the contribution of each tree
-        "max_depth": 3,  # Maximum depth of the individual regression estimators
-        "subsample": 0.8,  # The fraction of samples to be used for fitting the individual base learners
-        "min_samples_split": 2,  # The minimum number of samples required to split an internal node
-        "min_samples_leaf": 1,  # The minimum number of samples required to be at a leaf node
+    "Ridge": {"alpha": 1.0},
+    "Lasso": {"alpha": 0.0005, "max_iter": 20000, "random_state": 42},
+    "ElasticNet": {"alpha": 0.0005, "l1_ratio": 0.9, "max_iter": 20000, "random_state": 42},
+    "BayesianRidge": {"max_iter": 300},
+    "GradientBoostingRegressor": {
+        "n_estimators": 3000,
+        "learning_rate": 0.05,
+        "max_depth": 4,
+        "max_features": "sqrt",
+        "min_samples_leaf": 15,
+        "min_samples_split": 10,
+        "loss": "huber",       # robust to the price outliers that remain
+        "random_state": 5,
     },
-    "CatBoostClassifier": {
-        "iterations": 100,  # The maximum number of trees that can be built
-        "learning_rate": 0.1,  # The learning rate
-        "depth": 3,  # Depth of the tree
-    },
-    "XGBClassifier": {
-        "n_estimators": 100,  # Number of gradient boosted trees
-        "learning_rate": 0.1,  # Boosting learning rate
-        "max_depth": 3,  # Maximum tree depth
-        "gamma": 0,  # Minimum loss reduction required to make a further partition on a leaf node of the tree
-        "subsample": 0.8,  # Subsample ratio of the training instances
-        "colsample_bytree": 0.8,  # Subsample ratio of columns when constructing each tree
-    },
-    "RandomForestClassifier": {
-        "n_estimators": 100,  # The number of trees in the forest
-        "max_depth": 3,  # The maximum depth of the tree
-        "min_samples_split": 2,  # The minimum number of samples required to split an internal node
-        "min_samples_leaf": 1,  # The minimum number of samples required to be at a leaf node
-        "max_features": "sqrt",  # The number of features to consider when looking for the best split
-    },
-    "LogisticRegression": {
-        "C": 1.0,  # Inverse of regularization strength
-        "penalty": "l2",  # Used to specify the norm used in the penalization
-        "fit_intercept": True,  # Specifies if a constant (a.k.a. bias or intercept) should be added to the decision function
-        "solver": "liblinear",  # Algorithm to use in the optimization problem
+    "CatBoostRegressor": {"n_estimators": 1000, "depth": 3, "logging_level": "Silent"},
+    "LGBMRegressor": {
+        "boosting_type": "gbdt",
+        "objective": "regression",
+        "n_estimators": 100,
+        "learning_rate": 0.1,
+        "verbose": -1,
     },
 }
 
-
-# Parameter grids for hyperparameter tuning
 MODEL_PARAM_GRIDS = {
-    "GradientBoostingClassifier": {
-        "n_estimators": np.linspace(50, 200, 5, dtype=int),
-        "max_depth": np.linspace(3, 10, 5, dtype=int),
-        "learning_rate": np.linspace(0.001, 0.1, 10),
-        "subsample": np.linspace(0.05, 1, 10),
-        "min_samples_split": np.linspace(2, 100, 5, dtype=int),
-        "min_samples_leaf": np.linspace(1, 50, 5, dtype=int),
+    "Ridge": {
+        "ridge__alpha": [0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0],
+        "ridge__solver": ["auto", "svd", "cholesky", "lsqr", "sparse_cg", "sag", "saga"],
     },
-    "CatBoostClassifier": {
-        "iterations": np.linspace(50, 200, 5, dtype=int),
-        "depth": np.linspace(3, 10, 5, dtype=int),
-        "learning_rate": np.linspace(0.001, 0.1, 10),
-        "subsample": np.linspace(0.05, 1, 10),
-        "min_data_in_leaf": np.linspace(1, 50, 5, dtype=int),
+    "Lasso": {
+        "lasso__alpha": [0.0001, 0.0003, 0.0005, 0.001, 0.003, 0.005, 0.01, 0.03, 0.1],
+        "lasso__max_iter": [5000, 20000],
+        "lasso__selection": ["cyclic", "random"],
     },
-    "XGBClassifier": {
-        "n_estimators": np.linspace(50, 200, 5, dtype=int),
-        "max_depth": np.linspace(3, 10, 5, dtype=int),
-        "learning_rate": np.linspace(0.001, 0.1, 10),
-        "gamma": np.linspace(0.1, 1, 5),
-        "subsample": np.linspace(0.05, 1, 10),
-        "colsample_bytree": np.linspace(0.5, 1, 5),
+    "ElasticNet": {
+        "elasticnet__alpha": [0.0001, 0.0003, 0.0005, 0.001, 0.003, 0.005, 0.01, 0.03, 0.1],
+        "elasticnet__l1_ratio": [0.1, 0.3, 0.5, 0.7, 0.9, 0.95, 0.99],
+        "elasticnet__max_iter": [5000, 20000],
     },
-    "RandomForestClassifier": {
-        "n_estimators": np.linspace(50, 200, 5, dtype=int),
-        "max_depth": np.linspace(3, 10, 5, dtype=int),
-        "min_samples_split": np.linspace(2, 100, 5, dtype=int),
-        "min_samples_leaf": np.linspace(1, 50, 5, dtype=int),
-        "max_features": ["sqrt", "log2"],
+    "BayesianRidge": {
+        "bayesianridge__alpha_1": [1e-7, 1e-6, 1e-5, 1e-4],
+        "bayesianridge__alpha_2": [1e-7, 1e-6, 1e-5, 1e-4],
+        "bayesianridge__lambda_1": [1e-7, 1e-6, 1e-5, 1e-4],
+        "bayesianridge__lambda_2": [1e-7, 1e-6, 1e-5, 1e-4],
+        "bayesianridge__max_iter": [100, 200, 300, 400, 500],
     },
-    "LogisticRegression": {
-        "C": np.logspace(-2, 1, 5),
-        "fit_intercept": [True, False],
-        "solver": ["newton-cg", "lbfgs", "sag", "saga"],
-        "penalty": ["l2", None],
-        "l1_ratio": np.linspace(0, 1, 5),
+    "GradientBoostingRegressor": {
+        "gradientboostingregressor__learning_rate": [0.01, 0.05, 0.1, 0.15, 0.3],
+        "gradientboostingregressor__n_estimators": [100, 500, 1000, 2000, 3000],
+        "gradientboostingregressor__max_depth": [3, 4, 6, 9],
+        "gradientboostingregressor__min_samples_split": [2, 5, 10],
+        "gradientboostingregressor__min_samples_leaf": [1, 2, 5, 15],
+    },
+    "CatBoostRegressor": {
+        "catboostregressor__n_estimators": [100, 300, 500, 1000, 1300, 1600],
+        "catboostregressor__learning_rate": [0.0001, 0.001, 0.01, 0.1],
+        "catboostregressor__l2_leaf_reg": [0.001, 0.01, 0.1],
+        "catboostregressor__random_strength": [0.25, 0.5, 1],
+        "catboostregressor__depth": [3, 6, 9],  # CatBoost's own name; "max_depth" is a synonym and setting both errors
+        "catboostregressor__min_child_samples": [2, 5, 10, 15, 20],
+        "catboostregressor__border_count": [32, 64, 128, 255],
+    },
+    "LGBMRegressor": {
+        "lgbmregressor__max_depth": [3, 5, 8, 10],
+        "lgbmregressor__learning_rate": [0.001, 0.01, 0.1, 0.2],
+        "lgbmregressor__n_estimators": [100, 300, 500, 1000, 1500],
+        "lgbmregressor__reg_alpha": [0.0001, 0.001, 0.01],
+        "lgbmregressor__reg_lambda": [0, 0.0001, 0.001, 0.01],
+        "lgbmregressor__colsample_bytree": [0.4, 0.6, 0.8],
+        "lgbmregressor__min_child_samples": [5, 10, 20, 25],
+        "lgbmregressor__num_leaves": [31, 62, 124, 248],
     },
 }
+
+
+def grid_size(param_grid: dict) -> int:
+    """Number of distinct combinations in a discrete grid.
+
+    RandomizedSearchCV warns (and wastes work) when n_iter exceeds this.
+    """
+    total = 1
+    for values in param_grid.values():
+        total *= len(values)
+    return int(total)

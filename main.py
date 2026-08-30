@@ -1,139 +1,126 @@
-# Import configurations and utilities
+"""Ames housing price prediction -- end-to-end training pipeline.
+
+Reproduces the approach developed in reports/notebooks/regression_ames_house_prices.ipynb
+from the command line:
+
+    python main.py
+    python main.py training.models=[ridge,lasso] training.tune=false
+
+The evaluation protocol is the point of this script as much as the models are.
+Preprocessing is refit per fold, outliers leave the validation split alone,
+models are ranked out-of-fold, blend weights come from out-of-fold predictions,
+and the validation split is scored exactly once at the end.
+"""
+
 import hydra
+import pandas as pd
 from omegaconf import DictConfig
-from conf.model_config import (
-    DEFAULT_MODEL_PARAMETERS,
-    MODEL_PARAM_GRIDS,
-    MODEL_NAME_MAPPING,
-)
-
-# Import custom modules
-from src.dataloader.dataloader import DataLoader
-from src.dataloader.database_manager import DatabaseManager
-from src.features.cleaning import DataPreprocessor
-from src.features.transform import FeatureTransformer
-from src.train.model_factory import ModelFactory
-from src.train.model_trainer import ModelTrainer
 from sklearn.model_selection import train_test_split
+
+from src.dataloader.dataloader import DataLoader
+from src.features.cleaning import DataPreprocessor, outlier_index
+from src.features.transform import FeatureTransformer
+from src.pipe.sklearn_pipeline_manager import TransformerPipelineManager
+from src.train.inference import save_model, write_submission
+from src.train.model_factory import ModelFactory
+from src.train.model_trainer import ModelTrainer, evaluate
 from src.utils import Logger
+from src.visualization.visualize import plot_feature_importance, plot_pipeline
 
-# Initialize logger
 logger = Logger(__name__, "logs/log.log").get_logger()
-logger.info(f"{'-'*25} Starting the Machine learning pipeline {'-'*25}".center(50))
 
 
-@hydra.main(config_path="conf", config_name="config")
+@hydra.main(config_path="conf", config_name="config", version_base=None)
 def main(cfg: DictConfig) -> None:
-    """
-    Main function to orchestrate the machine learning pipeline from data loading,
-    preprocessing, training, and evaluation.
-    """
-    # Download and load data
-    data_loader = DataLoader(logger=logger)
-    save_path = data_loader.download(cfg.download_url)
+    logger.info(f"{'-' * 20} Ames regression pipeline starting {'-' * 20}")
+    pd.set_option("display.width", 120)
 
-    db_manager = DatabaseManager(logger=logger)
-    db_manager.create_connection(save_path)
-    df = db_manager.query("SELECT * FROM lung_cancer")
-    db_manager.close_connection()
+    # -- data ------------------------------------------------------------------
+    raw_train, x_all, y_train = DataLoader(cfg, logger).load()
 
-    # Data preprocessing
-    preprocessor = DataPreprocessor(df=df, cfg=cfg, logger=logger)
-    cleaned_df = preprocessor.preprocess()
+    # -- cleaning and feature engineering --------------------------------------
+    x_all, features = DataPreprocessor(x_all, cfg, logger).preprocess()
+    x_all, features = FeatureTransformer(x_all, features, cfg, logger).feature_engineer()
+    outliers = outlier_index(raw_train, cfg, logger)
 
-    # Feature Engineering
-    transformer = FeatureTransformer(df=cleaned_df, cfg=cfg, logger=logger)
-    processed_df = transformer.feature_engineer()
+    # -- splits ----------------------------------------------------------------
+    X = x_all.loc[raw_train.index]
+    y = y_train.loc[raw_train.index]
+    X_test = x_all.loc[x_all.index.difference(raw_train.index)]
 
-    # Data splitting (Avoid data leakage by splitting before feature transformation)
-    X_train, X_test, y_train, y_test = train_test_split(
-        processed_df.drop(cfg.features.target_variable, axis=1),
-        processed_df[cfg.features.target_variable],
-        test_size=0.2,
-        random_state=42,
+    X_train, X_val, Y_train, Y_val = train_test_split(
+        X, y, test_size=cfg.training.test_size, random_state=cfg.training.random_state
     )
 
-    # Feature transformation
-    X_train, y_train = transformer.fit_transform(X_train, y_train)
-    X_test, y_test = transformer.transform(X_test, y_test)
-
-    # Model training and evaluation
-    model_factory = ModelFactory()
-    mapped_models = [
-        MODEL_NAME_MAPPING[model]
-        for model in cfg.training.models
-        if model in MODEL_NAME_MAPPING
-    ]
-    models = model_factory.get_models(mapped_models if mapped_models else ["all"])
-
-    results = []
-    for model_name, model in models.items():
-        trainer = ModelTrainer(
-            model,
-            parameters={
-                **DEFAULT_MODEL_PARAMETERS[model_name],
-                "verbose": cfg.training.verbose,
-            },
-            logger=logger,
-        )
-        if cfg.training.tune:
-            param_grid = MODEL_PARAM_GRIDS[model_name]
-            best_params = trainer.random_tune_parameters(
-                X_train,
-                y_train,
-                param_grid,
-                tune_metric=cfg.training.tune_metric,
-                verbose=cfg.training.verbose,
-                n_iter=cfg.training.n_iter,
-            )
-            trainer.set_params(best_params)
-        trainer.train(X_train, y_train)
-        models[model_name] = trainer.model
-
-        y_pred = trainer.predict(X_test)
-        result = trainer.evaluate(y_test, y_pred)
-        result["model_name"] = model_name
-        results.append(result)
-        if cfg.training.save_model:
-            model_save_path = f"{cfg.training.save_dir}/{model_name}.pkl"
-            trainer.save_model(model_save_path)
-
-    if cfg.training.ensemble and len(models) > 1:
-        ensemble_models = [(name, model) for name, model in models.items()]
-        trainer = ModelTrainer(None, parameters={}, logger=logger)
-
-        # Voting Classifier
-        trainer.model = trainer.train_voting_classifier(
-            ensemble_models, X_train, y_train
-        )
-        voting_results = trainer.evaluate(y_test, trainer.model.predict(X_test))
-        voting_results["model_name"] = "VotingRegressor"
-        results.append(voting_results)
-        trainer.save_model(f"{cfg.training.save_dir}/VotingRegressor.pkl")
-
-        # Stacking Classifier
-        final_estimator = ModelFactory().get_models(["LogisticRegression"])[
-            "LogisticRegression"
-        ]
-        trainer.model = trainer.train_stacking_classifier(
-            ensemble_models, final_estimator, X_train, y_train
-        )
-        stacking_results = trainer.evaluate(y_test, trainer.model.predict(X_test))
-        stacking_results["model_name"] = "StackingRegressor"
-        results.append(stacking_results)
-        trainer.save_model(f"{cfg.training.save_dir}/StackingRegressor.pkl")
-
-    results.sort(key=lambda x: x[cfg.training.performance_metric], reverse=True)
-    best_result = results[0]
-    performance_metrics = ", ".join(
-        f"{metric}: {score:.2f}"
-        for metric, score in best_result.items()
-        if metric != "model_name"
-    )
+    # Outliers come out of the training split only. Removing them before the split
+    # also cleans the validation set, which flatters a score for something you
+    # cannot do at inference time.
+    before = len(X_train)
+    keep = ~X_train.index.isin(outliers)
+    X_train, Y_train = X_train.loc[keep], Y_train.loc[keep]
     logger.info(
-        f"Best model ranked using {cfg.training.performance_metric}: {best_result['model_name']} with performance metrics: {performance_metrics}"
+        f"Train {before} -> {len(X_train)} rows after removing {before - len(X_train)} outliers | "
+        f"val {len(X_val)} rows (untouched) | test {len(X_test)} rows"
     )
-    logger.info(f"{'-'*25} Machine learning pipeline completed {'-'*25}".center(50))
+
+    # -- pipeline and models ---------------------------------------------------
+    pipeline_manager = TransformerPipelineManager(features, cfg, logger)
+    pipeline_manager.verify_coverage(x_all.columns)
+
+    trainer = ModelTrainer(pipeline_manager, cfg, logger)
+    models = ModelFactory(logger).get_models(list(cfg.training.models))
+    fitted = trainer.fit_base_models(models, X_train, Y_train)
+
+    if cfg.training.ensemble and len(fitted) > 1:
+        base_estimators = trainer.best_estimators(fitted)
+        logger.info("Training stacking regressor (out-of-fold meta-features)...")
+        fitted["Stacking"] = trainer.build_stacking(base_estimators, X_train, Y_train)
+        logger.info("Training voting regressor...")
+        fitted["Voting"] = trainer.build_voting(base_estimators, X_train, Y_train)
+
+    # -- evaluation ------------------------------------------------------------
+    val_scores = {name: evaluate(Y_val, m.predict(X_val)) for name, m in fitted.items()}
+    oof = trainer.out_of_fold(fitted, X_train, Y_train)
+    comparison = trainer.comparison_table(oof, Y_train, val_scores)
+
+    logger.info("Model comparison (ranked by out-of-fold RMSLE):")
+    for line in comparison.to_string(index=False).splitlines():
+        logger.info(f"  {line}")
+    logger.info(
+        "fold_std is the spread across folds -- where it exceeds the gap between "
+        "models, the ranking is noise rather than a result."
+    )
+
+    # Selected on the out-of-fold score, not on the split being reported.
+    best_name = comparison.iloc[0]["model"]
+    best_model = fitted[best_name]
+    logger.info(
+        f"Best model: {best_name} (OOF RMSLE {comparison.iloc[0]['oof_rmsle']:.5f} "
+        f"+/- {comparison.iloc[0]['fold_std']:.5f}, val RMSLE {val_scores[best_name]['rmsle']:.5f})"
+    )
+
+    # -- submissions -----------------------------------------------------------
+    write_submission(best_model.predict(X_test), X_test.index, cfg, best_name.lower(), logger)
+
+    if cfg.training.blend and len(fitted) > 1:
+        logger.info("Fitting blend weights on out-of-fold predictions...")
+        names, weights = trainer.blend_weights(oof, Y_train)
+        blend_val = trainer.blend_predict(fitted, X_val, names, weights)
+        logger.info(f"Blend on the held-out validation split: {evaluate(Y_val, blend_val)}")
+        write_submission(
+            trainer.blend_predict(fitted, X_test, names, weights),
+            X_test.index, cfg, "blend", logger,
+        )
+
+    # -- artefacts -------------------------------------------------------------
+    if cfg.training.save_model:
+        for name, model in fitted.items():
+            save_model(model, cfg, name.lower(), logger)
+
+    plot_pipeline(best_model, cfg, logger=logger)
+    plot_feature_importance(best_model, cfg, logger=logger)
+
+    logger.info(f"{'-' * 20} Ames regression pipeline complete {'-' * 20}")
 
 
 if __name__ == "__main__":

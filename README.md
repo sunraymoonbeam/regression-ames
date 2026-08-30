@@ -86,28 +86,55 @@ is what makes the numbers comparable:
 
 ```
 ├── reports/
-│   └── notebooks/
-│       └── regression_ames_house_prices.ipynb   # ← the actual work (118 cells)
+│   ├── notebooks/
+│   │   └── regression_ames_house_prices.ipynb   # the analysis, end to end
+│   └── figures/                                 # written by main.py
 ├── house_prices_advanced_regression_techniques/
 │   ├── submission/                              # Kaggle submission CSVs
 │   └── reference/                               # public Kaggle notebooks collected for study (not mine)
-├── conf/                                        # Hydra config + model params (see caveat below)
-├── src/                                         # modular pipeline scaffolding (see caveat below)
-├── main.py                                      # CLI entrypoint (see caveat below)
-├── main_sklearn_pipeline.py                     # sklearn-Pipeline variant of the same
+├── conf/                                        # Hydra config, column knowledge, model grids
+├── src/                                         # the CLI pipeline (see below)
+├── main.py                                      # CLI entrypoint
 ├── requirements.txt
 └── run.sh
 ```
 
-### A note on `src/`, `conf/` and `main.py`
+### The CLI pipeline
 
-These are carried over from an earlier classification project and are **not wired to the
-Ames dataset**. `conf/config.yaml` still points at a lung-cancer SQLite source and
-`conf/model_config.py` still registers classifiers, so `python main.py` will not reproduce
-anything in this README. They are kept here as the reusable pipeline skeleton they were
-intended to be — porting them to regression is outstanding work.
+`src/`, `conf/` and `main.py` implement the same approach as a configurable
+command-line pipeline, driven by Hydra:
 
-**Everything reported above comes from the notebook**, which is self-contained.
+```bash
+python main.py                                              # full run, all 7 models
+python main.py training.models=[ridge,lasso] training.tune=false   # fast
+python main.py training.n_iter=20 training.ensemble=false
+./run.sh preprocessing.numeric_scaling=standard
+```
+
+It shares the notebook's evaluation protocol — preprocessing refit per fold, outliers
+removed from the training split only, models ranked out-of-fold with fold σ reported,
+blend weights from out-of-fold predictions — and writes Kaggle submissions to
+`house_prices_advanced_regression_techniques/submission/`.
+
+| Module | Responsibility |
+|---|---|
+| `src/dataloader/dataloader.py` | Read the competition CSVs onto a shared index |
+| `src/features/cleaning.py` | Deterministic recoding, ordinal maps, structural column drops |
+| `src/features/transform.py` | Aggregate + age features, and the feature registry |
+| `src/pipe/sklearn_pipeline_manager.py` | `ColumnTransformer`, neighbourhood imputer, pipeline factory |
+| `src/train/model_factory.py` | Regressor construction from config |
+| `src/train/model_trainer.py` | Tuning, out-of-fold scoring, ensembles, NNLS blend |
+| `src/train/inference.py` | Submission writing, model persistence |
+| `conf/config.yaml` | Everything tunable |
+| `conf/feature_config.py` | Column knowledge (ordinal orders, aggregate definitions) |
+| `conf/model_config.py` | Model registry, defaults, search grids |
+
+Two invariants are enforced by assertion rather than convention, because both failed
+silently in earlier revisions: the feature registry must exactly match the columns in
+the frame (`FeatureTransformer.verify_registry`), and every column must be claimed by a
+transformer (`TransformerPipelineManager.verify_coverage`). `ColumnTransformer` defaults
+to `remainder='drop'`, so a column missing from the registry is discarded with no error
+and no warning — the model simply trains on less data than you think.
 
 ---
 
@@ -152,7 +179,10 @@ why `requirements.txt` carries bounds rather than bare names.
 ```bash
 python3.11 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+# either the notebook:
 jupyter lab reports/notebooks/regression_ames_house_prices.ipynb
+# or the CLI:
+python main.py
 ```
 
 The dataset is not committed (`data/` is gitignored). Download it from the

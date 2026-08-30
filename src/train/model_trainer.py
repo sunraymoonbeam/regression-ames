@@ -1,322 +1,231 @@
-import warnings
-import pickle
-from typing import List, Tuple, Dict, Any
-from sklearn.base import BaseEstimator
-from sklearn.ensemble import VotingClassifier, StackingClassifier
-from sklearn.model_selection import GridSearchCV, RandomizedSearchCV
-from sklearn.metrics import (
-    accuracy_score,
-    precision_score,
-    recall_score,
-    f1_score,
-    roc_auc_score,
-)
-from logging import Logger
+"""Training, tuning and honest evaluation.
 
-warnings.filterwarnings("ignore")
+Two rules shape this module:
 
+1. Nothing is scored on data that was used to fit it. Hyperparameters are tuned
+   by cross-validation, models are compared out-of-fold, blend weights are fitted
+   on out-of-fold predictions, and the validation split is touched exactly once,
+   at the end, as a final check.
+2. The reported metric is the one being optimised. The competition scores RMSLE,
+   so the target is log-transformed and the in-CV objective (neg MSE on the
+   transformed target) is then numerically identical to MSLE.
+"""
+
+import logging
+from math import sqrt
+from typing import Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+from numpy import exp, log1p
+from scipy.optimize import nnls
+from scipy.special import boxcox1p, inv_boxcox1p
+from sklearn.base import clone
+from sklearn.compose import TransformedTargetRegressor
+from sklearn.ensemble import StackingRegressor, VotingRegressor
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import KFold, RandomizedSearchCV, cross_val_predict
+from sklearn.preprocessing import FunctionTransformer, PowerTransformer
+
+from conf.model_config import MODEL_PARAM_GRIDS, grid_size
+
+
+# -- metrics -------------------------------------------------------------------
+
+def rmsle(y_true, y_pred) -> float:
+    """Root mean squared log error -- the competition metric."""
+    y_pred = np.clip(np.asarray(y_pred, dtype=float).ravel(), 1, None)
+    y_true = np.asarray(y_true, dtype=float).ravel()
+    return float(np.sqrt(np.mean((np.log1p(y_pred) - np.log1p(y_true)) ** 2)))
+
+
+def evaluate(y_true, y_pred) -> Dict[str, float]:
+    y_pred = np.asarray(y_pred, dtype=float).ravel()
+    y_true = np.asarray(y_true, dtype=float).ravel()
+    mse = mean_squared_error(y_true, y_pred)
+    return {
+        "rmsle": rmsle(y_true, y_pred),
+        "mae": mean_absolute_error(y_true, y_pred),
+        "rmse": sqrt(mse),
+        "r2": r2_score(y_true, y_pred),
+    }
+
+
+def target_transformer(method: str):
+    """Transformer applied to the target before fitting, inverted on predict."""
+    if method == "log":
+        return FunctionTransformer(func=log1p, inverse_func=exp, validate=True)
+    if method == "boxcox":
+        return FunctionTransformer(
+            func=lambda x: boxcox1p(x, 0.15),
+            inverse_func=lambda x: inv_boxcox1p(x, 0.15),
+            validate=True,
+        )
+    if method == "yeojohnson":
+        return PowerTransformer(method="yeo-johnson")
+    if method == "none":
+        return FunctionTransformer(validate=True)
+    raise ValueError(f"Unknown target_transform '{method}'")
+
+
+# -- training ------------------------------------------------------------------
 
 class ModelTrainer:
-    """
-    A class used to train machine learning models.
+    """Tunes, fits, and compares models on a shared evaluation protocol."""
 
-    Attributes:
-    -----------
-    model : BaseEstimator
-        The machine learning model to be trained.
-    parameters : Dict[str, Any]
-        The parameters of the model.
-    logger : Logger
-        A logger for logging events during model training.
-
-    Methods:
-    --------
-    set_params(params: Dict[str, Any]) -> None:
-        Sets the parameters of the model.
-
-    train(X_train: Any, y_train: Any) -> None:
-        Trains the model on the training data.
-
-    train_voting_classifier(models: List[Tuple[str, BaseEstimator]], X_train: Any, y_train: Any) -> VotingClassifier:
-        Train a VotingClassifier using the provided models.
-
-    train_stacking_classifier(models: List[Tuple[str, BaseEstimator]], final_estimator: BaseEstimator, X_train: Any, y_train: Any) -> StackingClassifier:
-        Train a StackingClassifier using the provided models and final estimator.
-
-    predict(X_test: Any) -> Any:
-        Makes predictions on the test data.
-
-    evaluate(y_test: Any, y_pred: Any) -> Dict[str, float]:
-        Evaluates the performance of the model on the test data.
-
-    grid_tune_parameters(X_train: Any, y_train: Any, param_grid: Dict[str, List[Any]], tune_metric: str, verbose: int = 0) -> Dict[str, Any]:
-        Tunes the hyperparameters of the model to optimize a specified metric using GridSearchCV.
-
-    random_tune_parameters(X_train: Any, y_train: Any, param_grid: Dict[str, List[Any]], tune_metric: str, verbose: int = 0, n_iter: int = 100) -> Dict[str, Any]:
-        Tunes the hyperparameters of the model to optimize a specified metric using RandomizedSearchCV.
-
-    save_model(filepath: str = 'models/model.pkl') -> None:
-        Saves the trained model to a pickle file.
-    """
-
-    def __init__(
-        self, model: BaseEstimator, parameters: Dict[str, Any], logger: Logger
-    ) -> None:
-        """
-        Initializes the ModelTrainer class with a model, its parameters, and a logger.
-
-        Parameters:
-        -----------
-        model : BaseEstimator
-            The machine learning model to be trained.
-        parameters : Dict[str, Any]
-            The parameters of the model.
-        logger : Logger
-            A logger for logging events during model training.
-        """
-        self.model = model
-        self.parameters = parameters
-        self.logger = logger
-
-    def set_params(self, params: Dict[str, Any]) -> None:
-        """
-        Set the parameters of the model.
-
-        Parameters:
-        -----------
-        params : Dict[str, Any]
-            A dictionary of parameter names and their corresponding values.
-        """
-        self.parameters = params
-        self.model.set_params(**params)
-
-    def train(self, X_train: Any, y_train: Any) -> None:
-        """
-        Trains the model on the training data.
-
-        Parameters:
-        -----------
-        X_train : Any
-            The training input samples.
-        y_train : Any
-            The target values (class labels).
-        """
-        self.logger.info(f"Starting training for {self.model.__class__.__name__}...")
-        self.model.set_params(**self.parameters)
-        self.model.fit(X_train, y_train)
-        self.logger.info(f"Finished training for {self.model.__class__.__name__}.")
-
-    def train_voting_classifier(
-        self, models: List[Tuple[str, BaseEstimator]], X_train: Any, y_train: Any
-    ) -> VotingClassifier:
-        """
-        Train a VotingClassifier using the provided models.
-
-        Parameters:
-        -----------
-        models : List[Tuple[str, BaseEstimator]]
-            A list of (str, estimator) tuples, where the string is the name of the estimator.
-        X_train : Any
-            The training input samples.
-        y_train : Any
-            The target values (class labels).
-
-        Returns:
-        --------
-        VotingClassifier
-            The trained VotingClassifier.
-        """
-        voting_clf = VotingClassifier(estimators=models, voting="soft")
-        self.logger.info(f"Starting training for VotingClassifier...")
-        voting_clf.fit(X_train, y_train)
-        self.logger.info(f"Finished training for VotingClassifier.")
-        return voting_clf
-
-    def train_stacking_classifier(
-        self,
-        models: List[Tuple[str, BaseEstimator]],
-        final_estimator: BaseEstimator,
-        X_train: Any,
-        y_train: Any,
-    ) -> StackingClassifier:
-        """
-        Train a StackingClassifier using the provided models and final estimator.
-
-        Parameters:
-        -----------
-        models : List[Tuple[str, BaseEstimator]]
-            A list of (str, estimator) tuples, where the string is the name of the estimator.
-        final_estimator : BaseEstimator
-            The final estimator to use. This estimator will be trained on the predictions of the base models.
-        X_train : Any
-            The training input samples.
-        y_train : Any
-            The target values (class labels).
-
-        Returns:
-        --------
-        StackingClassifier
-            The trained StackingClassifier.
-        """
-        stacking_clf = StackingClassifier(
-            estimators=models, final_estimator=final_estimator
+    def __init__(self, pipeline_manager, cfg, logger: logging.Logger = None) -> None:
+        self.pm = pipeline_manager
+        self.cfg = cfg
+        self.logger = logger or logging.getLogger(__name__)
+        self.transformer = target_transformer(cfg.training.target_transform)
+        self.cv = KFold(
+            n_splits=cfg.training.cv_folds,
+            shuffle=True,
+            random_state=cfg.training.random_state,
         )
-        self.logger.info(f"Starting training for StackingClassifier...")
-        stacking_clf.fit(X_train, y_train)
-        self.logger.info(f"Finished training for StackingClassifier.")
-        self.model = stacking_clf
-        self.parameters = stacking_clf.get_params()
-        return stacking_clf
 
-    def predict(self, X_test: Any) -> Any:
-        """
-        Makes predictions on the test data.
+    def _wrap(self, regressor) -> TransformedTargetRegressor:
+        return TransformedTargetRegressor(regressor=regressor, transformer=self.transformer)
 
-        Parameters:
-        -----------
-        X_test : Any
-            The test input samples.
+    def tune(self, class_name: str, model, X, y) -> TransformedTargetRegressor:
+        """Fit one model, tuning it by cross-validation if enabled."""
+        pipeline = self.pm.build_pipeline(model)
+        grid = MODEL_PARAM_GRIDS.get(class_name)
 
-        Returns:
-        --------
-        Any
-            The predictions made by the model.
-        """
-        return self.model.predict(X_test)
+        if not self.cfg.training.tune or not grid:
+            estimator = self._wrap(pipeline)
+            estimator.fit(X, y)
+            return estimator
 
-    def evaluate(self, y_test: Any, y_pred: Any) -> Dict[str, float]:
-        """
-        Evaluates the performance of the model on the test data.
-
-        Parameters:
-        -----------
-        y_test : Any
-            The true target values.
-        y_pred : Any
-            The predicted target values by the model.
-
-        Returns:
-        --------
-        Dict[str, float]
-            A dictionary containing the evaluation metrics.
-        """
-        metrics = {
-            "accuracy": accuracy_score(y_test, y_pred),
-            "recall": recall_score(y_test, y_pred),
-            "precision": precision_score(y_test, y_pred),
-            "f1": f1_score(y_test, y_pred),
-            "roc_auc": roc_auc_score(y_test, y_pred),
-        }
-        self.logger.info(
-            f"{self.model.__class__.__name__} performance - "
-            + ", ".join([f"{k}: {v}" for k, v in metrics.items()])
-        )
-        return metrics
-
-    def grid_tune_parameters(
-        self,
-        X_train: Any,
-        y_train: Any,
-        param_grid: Dict[str, List[Any]],
-        tune_metric: str,
-        verbose: int = 0,
-    ) -> Dict[str, Any]:
-        """
-        Tunes the hyperparameters of the model to optimize a specified metric using GridSearchCV.
-
-        Parameters:
-        -----------
-        X_train : Any
-            The training input samples.
-        y_train : Any
-            The target values (class labels).
-        param_grid : Dict[str, List[Any]]
-            The parameter grid to explore.
-        tune_metric : str
-            The metric to optimize.
-        verbose : int, optional
-            The verbosity level.
-
-        Returns:
-        --------
-        Dict[str, Any]
-            The best parameters found.
-        """
-        grid_search = GridSearchCV(
-            self.model, param_grid, cv=5, scoring=tune_metric, verbose=verbose
-        )
-        grid_search.fit(X_train, y_train)
-        self.logger.info(
-            f"Tuned parameters for {self.model.__class__.__name__}: {grid_search.best_params_}"
-        )
-        self.logger.info(
-            f"Best cross-validation score for {self.model.__class__.__name__}: {grid_search.best_score_}"
-        )
-        return grid_search.best_params_
-
-    def random_tune_parameters(
-        self,
-        X_train: Any,
-        y_train: Any,
-        param_grid: Dict[str, List[Any]],
-        tune_metric: str,
-        verbose: int = 0,
-        n_iter: int = 100,
-    ) -> Dict[str, Any]:
-        """
-        Tunes the hyperparameters of the model to optimize a specified metric using RandomizedSearchCV.
-
-        Parameters:
-        -----------
-        X_train : Any
-            The training input samples.
-        y_train : Any
-            The target values (class labels).
-        param_grid : Dict[str, List[Any]]
-            The parameter grid to explore.
-        tune_metric : str
-            The metric to optimize.
-        verbose : int, optional
-            The verbosity level.
-        n_iter : int, optional
-            The number of parameter settings that are sampled.
-
-        Returns:
-        --------
-        Dict[str, Any]
-            The best parameters found.
-        """
-        random_search = RandomizedSearchCV(
-            self.model,
-            param_grid,
+        # RandomizedSearchCV wastes work (and warns) when n_iter exceeds the grid.
+        n_iter = min(self.cfg.training.n_iter, grid_size(grid))
+        search = RandomizedSearchCV(
+            estimator=pipeline,
+            param_distributions=grid,
             n_iter=n_iter,
-            cv=5,
-            scoring=tune_metric,
-            verbose=verbose,
-            random_state=42,
+            cv=self.cfg.training.cv_folds,
+            n_jobs=-1,
+            refit=True,
+            scoring="neg_mean_squared_error",
         )
-        random_search.fit(X_train, y_train)
+        estimator = self._wrap(search)
+        estimator.fit(X, y)
         self.logger.info(
-            f"Tuned parameters for {self.model.__class__.__name__}: {random_search.best_params_}"
+            f"{class_name}: tuned over {n_iter} candidates -> {estimator.regressor_.best_params_}"
         )
-        self.logger.info(
-            f"Best cross-validation score for {self.model.__class__.__name__}: {random_search.best_score_}"
+        return estimator
+
+    def fit_base_models(self, models: Dict[str, object], X, y) -> Dict[str, TransformedTargetRegressor]:
+        fitted = {}
+        for class_name, model in models.items():
+            self.logger.info(f"Training {class_name}...")
+            fitted[class_name] = self.tune(class_name, model, X, y)
+        return fitted
+
+    def best_estimators(self, fitted: Dict[str, TransformedTargetRegressor]) -> List[Tuple[str, object]]:
+        """The tuned estimator out of each fitted model, as (name, estimator) pairs."""
+        pairs = []
+        for class_name, wrapped in fitted.items():
+            regressor = wrapped.regressor_
+            pipeline = getattr(regressor, "best_estimator_", regressor)
+            pairs.append((class_name.lower(), clone(pipeline.steps[-1][1])))
+        return pairs
+
+    def build_stacking(self, base_estimators, X, y) -> TransformedTargetRegressor:
+        """Stack with out-of-fold meta-features.
+
+        `cv` is what makes this correct: a meta-learner trained on in-sample base
+        predictions learns to trust models that have merely memorised the training
+        rows, and reliably underperforms its own base models.
+        """
+        stack = StackingRegressor(
+            estimators=base_estimators,
+            final_estimator=Ridge(alpha=1.0),
+            cv=self.cv,
+            passthrough=False,
+            n_jobs=-1,
         )
-        return random_search.best_params_
+        estimator = self._wrap(self.pm.build_pipeline(stack))
+        estimator.fit(X, y)
+        return estimator
 
-    def save_model(self, filepath: str = "models/model.pkl") -> None:
+    def build_voting(self, base_estimators, X, y) -> TransformedTargetRegressor:
+        estimator = self._wrap(self.pm.build_pipeline(VotingRegressor(estimators=base_estimators)))
+        estimator.fit(X, y)
+        return estimator
+
+    # -- evaluation ------------------------------------------------------------
+
+    def _unfitted_copy(self, wrapped: TransformedTargetRegressor) -> TransformedTargetRegressor:
+        regressor = wrapped.regressor_
+        pipeline = getattr(regressor, "best_estimator_", regressor)
+        return self._wrap(clone(pipeline))
+
+    def out_of_fold(self, fitted: Dict[str, TransformedTargetRegressor], X, y) -> Dict[str, np.ndarray]:
+        """Out-of-fold predictions on the training split, one pass per model.
+
+        Reused for both the model comparison and the blend weights, so the extra
+        fits are paid for once.
         """
-        Saves the trained model to a pickle file.
+        oof = {}
+        for name, wrapped in fitted.items():
+            oof[name] = cross_val_predict(self._unfitted_copy(wrapped), X, y, cv=self.cv, n_jobs=1)
+            self.logger.info(f"out-of-fold predictions done: {name}")
+        return oof
 
-        Parameters:
-        -----------
-        filepath : str, optional
-            The path to save the pickle file.
+    def comparison_table(self, oof: Dict[str, np.ndarray], y,
+                         val_scores: Dict[str, Dict[str, float]] = None) -> pd.DataFrame:
+        """Rank models out-of-fold, with the fold-to-fold spread alongside.
 
-        Returns:
-        --------
-        None
+        The spread matters more than the ranking: on ~1,200 rows it routinely
+        exceeds the gap between first and last place, and a ranking inside the
+        noise is not a result.
         """
-        with open(filepath, "wb") as f:
-            pickle.dump(self.model, f)
-        self.logger.info(f"{self.model.__class__.__name__} saved to {filepath}.")
+        folds = list(self.cv.split(np.zeros(len(y))))
+        y = pd.Series(np.asarray(y, dtype=float).ravel())
+
+        rows = []
+        for name, preds in oof.items():
+            fold_scores = [rmsle(y.iloc[te], preds[te]) for _, te in folds]
+            row = {
+                "model": name,
+                "oof_rmsle": rmsle(y, preds),
+                "fold_std": float(np.std(fold_scores)),
+            }
+            if val_scores and name in val_scores:
+                row["val_rmsle"] = val_scores[name]["rmsle"]
+                row["val_rmse"] = val_scores[name]["rmse"]
+            rows.append(row)
+
+        return pd.DataFrame(rows).sort_values("oof_rmsle").reset_index(drop=True)
+
+    def blend_weights(self, oof: Dict[str, np.ndarray], y) -> Tuple[List[str], np.ndarray]:
+        """Non-negative least squares weights, fitted on out-of-fold predictions.
+
+        Fitting weights on validation scores and then reporting the blend's score
+        on that same split measures nothing. Non-negativity keeps the result a
+        genuine weighted average; the fit is in log space to match the metric.
+        """
+        names = list(oof)
+        A = np.column_stack([np.log1p(np.clip(oof[n], 1, None)) for n in names])
+        b = np.log1p(np.asarray(y, dtype=float).ravel())
+
+        w, _ = nnls(A, b)
+        if w.sum() == 0:
+            w = np.ones(len(names))
+        weights = w / w.sum()
+
+        for name, weight in sorted(zip(names, weights), key=lambda t: -t[1]):
+            self.logger.info(f"  blend weight {name:28s} {weight:.4f}")
+        return names, weights
+
+    @staticmethod
+    def blend_predict(fitted: Dict[str, TransformedTargetRegressor], X,
+                      names: List[str], weights: np.ndarray) -> np.ndarray:
+        """Weighted geometric blend -- arithmetic in log space, matching RMSLE."""
+        logp = np.column_stack([
+            np.log1p(np.clip(np.asarray(fitted[n].predict(X), dtype=float).ravel(), 1, None))
+            for n in names
+        ])
+        return np.expm1(logp @ weights)
